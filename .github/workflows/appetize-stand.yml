@@ -95,9 +95,9 @@ jobs:
           xcodebuild -list -project "$XCODE_PROJECT"
           xcodebuild \
             -project "$XCODE_PROJECT" \
-            -target "$XCODE_TARGET" \
+            -scheme "$XCODE_TARGET" \
             -configuration Release \
-            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
             -derivedDataPath "$DERIVED_DATA" \
             -onlyUsePackageVersionsFromResolvedFile \
             CODE_SIGNING_ALLOWED=NO \
