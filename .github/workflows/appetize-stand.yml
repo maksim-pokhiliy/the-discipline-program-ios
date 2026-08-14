@@ -1,0 +1,209 @@
+name: appetize-stand
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Origin the built app calls; it appends /api/v1 itself (Release config)"
+        required: true
+        default: "https://platform.thedisciplineprogram.com"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appetize-stand
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    runs-on: macos-15
+    env:
+      XCODE_PROJECT: TheDisciplineProgram.xcodeproj
+      XCODE_TARGET: TheDisciplineProgram
+      APP_BUNDLE: TheDisciplineProgram.app
+      CONSTANTS_FILE: TheDisciplineProgram/Utilities/Constants.swift
+      DERIVED_DATA: build
+      PRODUCTS_DIR: build/Build/Products/Release-iphonesimulator
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          echo "Xcode installs on this image:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          if [ -d /Applications/Xcode_16.4.app ]; then
+            selected=/Applications/Xcode_16.4.app
+          else
+            selected=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          fi
+          if [ -z "${selected:-}" ]; then
+            echo "::error::no Xcode 16.x on this runner; the project needs objectVersion 77 support"
+            exit 1
+          fi
+          sudo xcode-select -s "$selected"
+          xcodebuild -version
+          {
+            echo "XCODE_APP=$selected"
+            echo "XCODE_VERSION=$(xcodebuild -version | tr '\n' ' ')"
+          } >> "$GITHUB_ENV"
+
+      - name: Point the app at the shim
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          path = os.environ["CONSTANTS_FILE"]
+          base_url = os.environ["BASE_URL"]
+
+          if not re.fullmatch(r"https://[A-Za-z0-9.-]+(:\d+)?", base_url):
+              sys.exit(f"::error::base_url must be a bare https origin, got {base_url!r}")
+
+          anchor = 'static let baseURL = "https://thedisciplineprogram.com"'
+          replacement = f'static let baseURL = "{base_url}"'
+
+          with open(path, encoding="utf-8") as handle:
+              source = handle.read()
+
+          found = source.count(anchor)
+          if found != 1:
+              sys.exit(f"::error::expected the baseURL anchor exactly once in {path}, found {found}")
+
+          with open(path, "w", encoding="utf-8") as handle:
+              handle.write(source.replace(anchor, replacement))
+          PY
+          if grep -qF 'static let baseURL = "https://thedisciplineprogram.com"' "$CONSTANTS_FILE"; then
+            echo "::error::the original host is still present after patching"
+            exit 1
+          fi
+          if ! grep -qF "static let baseURL = \"$BASE_URL\"" "$CONSTANTS_FILE"; then
+            echo "::error::the patched host is absent after patching"
+            exit 1
+          fi
+          grep -n 'static let baseURL' "$CONSTANTS_FILE"
+
+      - name: Build the simulator app
+        run: |
+          set -euo pipefail
+          xcodebuild -list -project "$XCODE_PROJECT"
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -target "$XCODE_TARGET" \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -derivedDataPath "$DERIVED_DATA" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - name: Verify the bundle is a simulator build
+        run: |
+          set -euo pipefail
+          app="$PRODUCTS_DIR/$APP_BUNDLE"
+          if [ ! -d "$app" ]; then
+            echo "::error::no app bundle at $app"
+            ls -R "$DERIVED_DATA/Build/Products" || true
+            exit 1
+          fi
+          plist="$app/Info.plist"
+          plutil -p "$plist"
+          platforms=$(plutil -extract CFBundleSupportedPlatforms json -o - "$plist" 2>/dev/null || echo "")
+          echo "CFBundleSupportedPlatforms=$platforms"
+          if printf '%s' "$platforms" | grep -q iPhoneSimulator; then
+            echo "PLIST_PATCHED=no" >> "$GITHUB_ENV"
+          else
+            echo "::warning::the built Info.plist still declares a device platform; patching the artifact"
+            plutil -replace CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$plist"
+            plutil -replace DTPlatformName -string iphonesimulator "$plist"
+            plutil -remove UIRequiredDeviceCapabilities "$plist" || true
+            plutil -p "$plist"
+            echo "PLIST_PATCHED=yes" >> "$GITHUB_ENV"
+          fi
+          lipo -archs "$app/$XCODE_TARGET" || true
+
+      - name: Zip the bundle
+        run: |
+          set -euo pipefail
+          (cd "$PRODUCTS_DIR" && zip -qry "$GITHUB_WORKSPACE/App.zip" "$APP_BUNDLE")
+          ls -lh App.zip
+          echo "ZIP_SIZE=$(du -h App.zip | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Upload to Appetize
+        env:
+          APPETIZE_API_TOKEN: ${{ secrets.APPETIZE_API_TOKEN }}
+          APPETIZE_PUBLIC_KEY: ${{ vars.APPETIZE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPETIZE_API_TOKEN:-}" ]; then
+            echo "::error::APPETIZE_API_TOKEN is not set on this repository"
+            exit 1
+          fi
+          if [ -n "${APPETIZE_PUBLIC_KEY:-}" ]; then
+            mode=update
+            endpoint="https://api.appetize.io/v1/apps/$APPETIZE_PUBLIC_KEY"
+          else
+            mode=create
+            endpoint="https://api.appetize.io/v1/apps"
+          fi
+          echo "mode=$mode"
+          status=$(curl -sS -X POST "$endpoint" \
+            -H "X-API-KEY: $APPETIZE_API_TOKEN" \
+            -F "file=@App.zip" \
+            -F "platform=ios" \
+            -o response.json -w '%{http_code}')
+          echo "http_status=$status"
+          if [ "$status" != "200" ]; then
+            echo "::error::appetize $mode returned HTTP $status"
+            cat response.json || true
+            if [ "$status" = "404" ] && [ "$mode" = "update" ]; then
+              echo "::error::the APPETIZE_PUBLIC_KEY variable points at an app that no longer exists; clear it and re-run to create a new slot"
+            fi
+            exit 1
+          fi
+          public_key=$(jq -r '.publicKey // empty' response.json)
+          if [ -z "$public_key" ]; then
+            echo "::error::appetize returned 200 without a publicKey"
+            cat response.json
+            exit 1
+          fi
+          {
+            echo "APPETIZE_MODE=$mode"
+            echo "APPETIZE_RESULT_KEY=$public_key"
+          } >> "$GITHUB_ENV"
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## Appetize stand"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| xcode | $XCODE_VERSION |"
+            echo "| base_url | ${{ inputs.base_url }} |"
+            echo "| info.plist patched | $PLIST_PATCHED |"
+            echo "| zip size | $ZIP_SIZE |"
+            echo "| appetize action | $APPETIZE_MODE |"
+            echo "| publicKey | \`$APPETIZE_RESULT_KEY\` |"
+            echo "| app url | https://appetize.io/app/$APPETIZE_RESULT_KEY |"
+            echo ""
+            if [ "$APPETIZE_MODE" = "create" ]; then
+              echo "First upload: store the key so later runs update this same slot —"
+              echo '```'
+              echo "gh variable set APPETIZE_PUBLIC_KEY -R maksim-pokhiliy/the-discipline-program-ios -b $APPETIZE_RESULT_KEY"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
